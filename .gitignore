@@ -91,3 +91,9 @@ logs/
 .serverless/
 .aws/
 .gcp/
+
+# Cloned upstream tools — re-clone via README, don't track here
+auto-prompt-creator/
+reddit-find/
+research-process-builder/
+techsight-cli/

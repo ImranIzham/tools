@@ -1,0 +1,93 @@
+# OS
+.DS_Store
+Thumbs.db
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-store/
+.npm/
+
+# Claude Code session artifacts
+.claude/projects/
+.claude/cache/
+
+# SECRETS — NEVER COMMIT
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+.env.staging
+.envrc
+*.key
+*.pem
+*.p12
+*.pfx
+*.token
+secrets.json
+secrets.yaml
+credentials.json
+credentials.yaml
+auth.json
+service-account.json
+google-credentials.json
+firebase-credentials.json
+
+# Client API key files (any pattern matching client-*.json with api_key inside)
+api/*.json
+client-*-api.json
+**/api-keys/
+
+# Build artifacts
+dist/
+build/
+*.tsbuildinfo
+.next/
+.nuxt/
+.turbo/
+
+# Logs
+*.log
+logs/
+
+# Cache
+.cache/
+.parcel-cache/
+.eslintcache
+
+# Tooling
+.trigger/
+.serverless/
+.aws/
+.gcp/

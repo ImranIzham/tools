@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""Read personal Gmail over IMAP using a Google app password.
+
+Credentials live in ~/.config-google-personal/imap.env (mode 600):
+    PERSONAL_GMAIL_USER=you@gmail.com
+    PERSONAL_GMAIL_APP_PASSWORD=abcdefghijklmnop
+
+Examples:
+    pmail folders
+    pmail list --limit 20
+    pmail list --unread --limit 10
+    pmail search "from:stripe.com newer_than:30d"
+    pmail search "has:attachment invoice" --json
+    pmail read 18f2c1a9b4e5
+"""
+
+import argparse
+import email
+import email.policy
+import imaplib
+import json
+import os
+import re
+import sys
+from email.header import decode_header, make_header
+from pathlib import Path
+
+CONFIG = Path.home() / ".config-google-personal" / "imap.env"
+IMAP_HOST = "imap.gmail.com"
+
+
+def load_creds():
+    user = os.environ.get("PERSONAL_GMAIL_USER")
+    pw = os.environ.get("PERSONAL_GMAIL_APP_PASSWORD")
+    if not (user and pw) and CONFIG.exists():
+        for line in CONFIG.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            v = v.strip().strip('"').strip("'")
+            if k.strip() == "PERSONAL_GMAIL_USER":
+                user = user or v
+            elif k.strip() == "PERSONAL_GMAIL_APP_PASSWORD":
+                pw = pw or v
+    if not (user and pw):
+        sys.exit(f"Missing credentials. Create {CONFIG} with PERSONAL_GMAIL_USER "
+                 "and PERSONAL_GMAIL_APP_PASSWORD (app password, spaces removed).")
+    return user, pw.replace(" ", "")
+
+
+def connect():
+    user, pw = load_creds()
+    try:
+        M = imaplib.IMAP4_SSL(IMAP_HOST)
+        M.login(user, pw)
+    except imaplib.IMAP4.error as e:
+        sys.exit(f"IMAP login failed: {e}\n"
+                 "Check the app password, and that IMAP is enabled in Gmail settings.")
+    return M
+
+
+def decode(s):
+    if not s:
+        return ""
+    try:
+        return str(make_header(decode_header(s)))
+    except Exception:
+        return s
+
+
+def body_text(msg):
+    """Prefer text/plain; fall back to crudely de-tagged text/html."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain" and \
+               "attachment" not in str(part.get("Content-Disposition", "")):
+                try:
+                    return part.get_content()
+                except Exception:
+                    pass
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                try:
+                    return strip_html(part.get_content())
+                except Exception:
+                    pass
+        return ""
+    try:
+        content = msg.get_content()
+    except Exception:
+        return ""
+    return strip_html(content) if msg.get_content_type() == "text/html" else content
+
+
+def strip_html(html):
+    html = re.sub(r"(?is)<(script|style).*?</\1>", "", html)
+    html = re.sub(r"(?i)<br\s*/?>", "\n", html)
+    html = re.sub(r"(?i)</p>", "\n\n", html)
+    text = re.sub(r"<[^>]+>", "", html)
+    text = (text.replace("&nbsp;", " ").replace("&amp;", "&")
+                .replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"'))
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def fetch_headers(M, uids):
+    out = []
+    if not uids:
+        return out
+    # Batch the fetch rather than one round trip per message.
+    typ, data = M.uid("FETCH", b",".join(uids).decode(),
+                      "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)] FLAGS)")
+    if typ != "OK":
+        return out
+    uid_re = re.compile(rb"UID (\d+)")
+    flag_re = re.compile(rb"FLAGS \(([^)]*)\)")
+    for item in data:
+        if not isinstance(item, tuple):
+            continue
+        meta, raw = item[0], item[1]
+        um, fm = uid_re.search(meta), flag_re.search(meta)
+        hdr = email.message_from_bytes(raw, policy=email.policy.default)
+        flags = fm.group(1).decode() if fm else ""
+        out.append({
+            "uid": um.group(1).decode() if um else "",
+            "date": decode(hdr.get("Date")),
+            "from": decode(hdr.get("From")),
+            "to": decode(hdr.get("To")),
+            "subject": decode(hdr.get("Subject")),
+            "unread": "\\Seen" not in flags,
+        })
+    return out
+
+
+def cmd_folders(M, args):
+    typ, data = M.list()
+    names = []
+    for line in data or []:
+        m = re.search(r'"([^"]*)"$', line.decode())
+        if m:
+            names.append(m.group(1))
+    print("\n".join(names) if not args.json else json.dumps(names, indent=2))
+
+
+def select(M, folder):
+    typ, _ = M.select(f'"{folder}"', readonly=True)
+    if typ != "OK":
+        sys.exit(f"Cannot open folder: {folder}")
+
+
+def render(rows, as_json):
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No messages.")
+        return
+    for r in rows:
+        mark = "●" if r["unread"] else " "
+        print(f"{mark} [{r['uid']}] {r['date'][:31]}")
+        print(f"    from: {r['from'][:90]}")
+        print(f"    subj: {r['subject'][:90]}")
+    print(f"\n{len(rows)} message(s).")
+
+
+def cmd_list(M, args):
+    select(M, args.folder)
+    crit = "(UNSEEN)" if args.unread else "ALL"
+    typ, data = M.uid("SEARCH", None, crit)
+    uids = data[0].split() if data and data[0] else []
+    uids = uids[-args.limit:][::-1]
+    render(fetch_headers(M, uids), args.json)
+
+
+def cmd_search(M, args):
+    select(M, args.folder)
+    # X-GM-RAW gives us real Gmail search syntax, not IMAP's crude version.
+    typ, data = M.uid("SEARCH", None, "X-GM-RAW", f'"{args.query}"')
+    if typ != "OK":
+        sys.exit(f"Search failed: {data}")
+    uids = data[0].split() if data and data[0] else []
+    uids = uids[-args.limit:][::-1]
+    render(fetch_headers(M, uids), args.json)
+
+
+def cmd_read(M, args):
+    select(M, args.folder)
+    typ, data = M.uid("FETCH", args.uid, "(RFC822)")
+    if typ != "OK" or not data or not isinstance(data[0], tuple):
+        sys.exit(f"Message {args.uid} not found in {args.folder}.")
+    msg = email.message_from_bytes(data[0][1], policy=email.policy.default)
+    body = body_text(msg)
+    if args.json:
+        print(json.dumps({
+            "uid": args.uid,
+            "date": decode(msg.get("Date")),
+            "from": decode(msg.get("From")),
+            "to": decode(msg.get("To")),
+            "cc": decode(msg.get("Cc")),
+            "subject": decode(msg.get("Subject")),
+            "body": body,
+        }, indent=2))
+        return
+    print(f"Date:    {decode(msg.get('Date'))}")
+    print(f"From:    {decode(msg.get('From'))}")
+    print(f"To:      {decode(msg.get('To'))}")
+    if msg.get("Cc"):
+        print(f"Cc:      {decode(msg.get('Cc'))}")
+    print(f"Subject: {decode(msg.get('Subject'))}")
+    print("-" * 72)
+    print(body.strip()[:args.max_chars])
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Read personal Gmail over IMAP.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__)
+    p.add_argument("--folder", default="INBOX", help="IMAP folder (default: INBOX)")
+    p.add_argument("--json", action="store_true", help="JSON output")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("folders", help="List available folders")
+
+    lp = sub.add_parser("list", help="List recent messages")
+    lp.add_argument("--limit", type=int, default=20)
+    lp.add_argument("--unread", action="store_true", help="Unread only")
+
+    sp = sub.add_parser("search", help="Search with Gmail query syntax")
+    sp.add_argument("query")
+    sp.add_argument("--limit", type=int, default=20)
+
+    rp = sub.add_parser("read", help="Read one message by UID")
+    rp.add_argument("uid")
+    rp.add_argument("--max-chars", type=int, default=8000)
+
+    args = p.parse_args()
+    M = connect()
+    try:
+        {"folders": cmd_folders, "list": cmd_list,
+         "search": cmd_search, "read": cmd_read}[args.cmd](M, args)
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,89 @@
+#!/usr/bin/env -S /Users/imranizham/workspace/Scouter/scouter/.venv/bin/python3
+"""shot - headless background screenshots. No window, no focus stealing.
+
+  shot https://example.com                        -> ~/Downloads/example.com.png
+  shot https://example.com -o out.png --full      full-page
+  shot https://example.com --sel "#pricing"       just that element
+  shot -f urls.txt -d ./shots                     batch
+  shot https://app.instantly.ai --profile insta   logged-in (first run: --login)
+  shot https://x.com/foo --login --profile x      opens a real window ONCE to log in
+
+Flags: --full --wait MS --width --height --scale --sel CSS --profile NAME --login --pdf
+"""
+import argparse, pathlib, re, sys, time
+from urllib.parse import urlparse
+from playwright.sync_api import sync_playwright
+
+PROFILES = pathlib.Path.home() / ".shot-profiles"
+
+def slug(url):
+    p = urlparse(url)
+    s = (p.netloc + p.path).rstrip("/").replace("/", "_")
+    return re.sub(r"[^A-Za-z0-9._-]", "-", s) or "shot"
+
+def main():
+    a = argparse.ArgumentParser()
+    a.add_argument("url", nargs="?")
+    a.add_argument("-f", "--file", help="file of URLs, one per line")
+    a.add_argument("-o", "--out")
+    a.add_argument("-d", "--dir", default=str(pathlib.Path.home() / "Downloads"))
+    a.add_argument("--full", action="store_true")
+    a.add_argument("--sel")
+    a.add_argument("--wait", type=int, default=1200)
+    a.add_argument("--width", type=int, default=1440)
+    a.add_argument("--height", type=int, default=900)
+    a.add_argument("--scale", type=float, default=2)
+    a.add_argument("--profile")
+    a.add_argument("--login", action="store_true")
+    a.add_argument("--pdf", action="store_true")
+    args = a.parse_args()
+
+    urls = []
+    if args.file:
+        urls = [l.strip() for l in open(args.file) if l.strip() and not l.startswith("#")]
+    elif args.url:
+        urls = [args.url]
+    else:
+        a.error("give a URL or -f urls.txt")
+
+    outdir = pathlib.Path(args.dir).expanduser(); outdir.mkdir(parents=True, exist_ok=True)
+    vp = {"width": args.width, "height": args.height}
+
+    with sync_playwright() as p:
+        if args.profile:
+            PROFILES.mkdir(exist_ok=True)
+            ctx = p.chromium.launch_persistent_context(
+                str(PROFILES / args.profile), headless=not args.login,
+                viewport=vp, device_scale_factor=args.scale)
+            browser = None
+        else:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context(viewport=vp, device_scale_factor=args.scale)
+
+        if args.login:
+            pg = ctx.new_page(); pg.goto(urls[0])
+            print("Log in in the window, then press Enter here...", file=sys.stderr)
+            input()
+            ctx.close(); print(f"session saved -> {PROFILES/args.profile}"); return
+
+        pg = ctx.new_page()
+        for u in urls:
+            try:
+                pg.goto(u, wait_until="networkidle", timeout=45000)
+            except Exception:
+                pg.goto(u, timeout=45000)
+            pg.wait_for_timeout(args.wait)
+            ext = "pdf" if args.pdf else "png"
+            out = pathlib.Path(args.out) if (args.out and len(urls) == 1) else outdir / f"{slug(u)}.{ext}"
+            if args.pdf:
+                pg.pdf(path=str(out), print_background=True)
+            elif args.sel:
+                pg.locator(args.sel).first.screenshot(path=str(out))
+            else:
+                pg.screenshot(path=str(out), full_page=args.full)
+            print(out)
+        ctx.close()
+        if browser: browser.close()
+
+if __name__ == "__main__":
+    main()
